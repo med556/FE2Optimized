@@ -1,543 +1,477 @@
---TIMELINE RUNTIME V1 BY CRAZYBLOX
+-- TIMELINE RUNTIME V1 OPTIMIZED
+-- med556deluxe/Contrastual, originally by Crazyblox, 2024/1/28
 
---------TERMS AND CONDITIONS:
---This script is open source and falls under the Creative Commons (CC BY-SA 4.0) license.
---In essence, this is free to use/edit/share etc, but you MUST credit, disclose changes, share and maintain the same license/T&C's.
---A good place to credit Crazyblox (The author of this script) is within your work's publicly accessible credits, such as your games description.
+-- This script is an optimized version of Flood Escape 2's Timelines V1 runtime, with some changes listed below:
+-- + TimelinePlayer.Tween now has the same behavior as TimelinePlayer.SetProperties.
+-- + This script's internal workings now abide by the camelCase naming convention.
+--   TimelinePlayer functions are still named via PascalCase.
+-- + MovePart no longer relies on a CFrameValue object and instead computes interpolation on the fly.
+--   + This has the added benefit of combining with other MovePart functions, which modern FE2 cannot do. This was possible before
+--     the introduction of MapScript.MovePart in FE2.
+-- + Added proper functionality to relative properties.
+-- + This script attempts to reduce the amount of index, newindex, and namecall operations with the engine,
+--   allowing for better performance. You may be interested in reversing some of this as some of these localizations do inflate
+--   the stack.
+-- + XFrame functions now reside on a table, allowing modular addition of new functions.
+-- + The InternalValues table in TimelinePlayer.SetProperties is now in the main thread to help ease the stack by not generating
+--   a new table everytime TimelinePlayer.SetProperties is called.
 
-local Timelines = script.Parent:WaitForChild("Timelines")
-if not Timelines then
-	error("Map requires 'Timelines' to function")
-end
+-- The original runtime is provided by Crazyblox. See the repository here: https://github.com/Crazyblox-Games/FloodEscape2
+-- This work is licensed under CC BY-SA 4.0. To view a copy of this license, visit http://creativecommons.org/licenses/by-sa/4.0/
+
+local timelines = script.Parent:WaitForChild("Timelines")
+if not timelines then error("Map requires 'Timelines' to function") end
+
 local Lib = workspace.Multiplayer.GetMapVals:Invoke()
-local TweenService = game:GetService("TweenService")
-local TimelinePlayer = {}
 
---Changes state of water and changes color
-function TimelinePlayer.SetWaterState(water, state, noChangeColor, specifiedColor)
+local players = game:FindService("Players")
+local tweenService = game:FindService("TweenService")
+local heartbeat = game:FindService("RunService").Heartbeat
+
+local timelinePlayer = {}
+local internalTweenConfigs = {}
+
+local function translatePart(startTime, obj, translation, duration, isLocalSpace, easingStyle, easingDirection, isModel)
+	easingStyle, easingDirection = Enum.EasingStyle[easingStyle], Enum.EasingDirection[easingDirection]
+
+	local translateCheckpoint = Vector3.zero
+	
+	while true do
+		local time = math.min(duration, tick() - startTime)
+		
+		local translate = translation * tweenService:GetValue(time / duration, easingStyle, easingDirection)
+		local interpolation = translate - translateCheckpoint
+		translateCheckpoint = translate
+		
+		if isModel then
+			heartbeat:Wait()
+			local pivot = obj:GetPivot()
+			obj:PivotTo(isLocalSpace and pivot * CFrame.new(interpolation) or pivot + interpolation)
+			continue
+		end
+		
+		local objCFrame = obj.CFrame
+		obj.CFrame = isLocalSpace and objCFrame * CFrame.new(interpolation) or objCFrame + interpolation
+		
+		heartbeat:Wait()
+	end
+end
+
+function timelinePlayer.SetWaterState(water, state, noChangeColor, specifiedColor)
 	if water:IsA("BasePart") then
+		state = state or string.lower(state)
 		local oldColor = water.Color
 		local newColor = specifiedColor
-			or (string.lower(state) == "water" or state == nil) and BrickColor.new("Deep blue").Color
-			or string.lower(state) == "acid" and BrickColor.new("Lime green").Color
-			or string.lower(state) == "lava" and BrickColor.new("Really red").Color
-		if noChangeColor ~= true then
-			local tInfo = TweenInfo.new(1, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, 0, false, 0)
-			local PropTable = { Color = newColor }
-			local ColorTween = TweenService:Create(water, tInfo, PropTable)
-			ColorTween:Play()
+			or (not state or state == "water") and Color3.fromRGB(33, 85, 185)
+			or state == "acid" and Color3.new(0, 1)
+			or state == "lava" and Color3.new(1)
+		if not noChangeColor then
+			tweenService:Create(water, TweenInfo.new(1, Enum.EasingStyle.Linear), {Color = newColor}):Play()
 		end
-		delay(1, function()
+		task.defer(function()
 			local updState = water:FindFirstChild("WaterState")
 			if updState then
-				updState.Value = string.lower(state)
+				updState.Value = state
 			end
-
-			if noChangeColor ~= true then
+			if not noChangeColor then
 				water.Color = newColor
 			end
 		end)
 	end
 end
 
---Function that moves parts and models; used primarily for floods
-local InternalTweenConfigs = {}
-function TimelinePlayer.MovePart(Object, Translation, Duration, IsLocalSpace, EasingStyle, EasingDirection)
-	if typeof(Object) ~= "Instance" then
+function timelinePlayer.MovePart(obj, translation, duration, isLocalSpace, easingStyle, easingDirection)
+	if typeof(obj) ~= "Instance" then
 		error("Object: Only an Instance (Model, BasePart) can be provided")
 	end
-	if not (Object:IsA("Model") or Object:IsA("BasePart")) then
+	if not (obj:IsA("Model") or obj:IsA("BasePart")) then
 		error("Object: MovePart can only accept a Model with a PrimaryPart or a BasePart")
 	end
-	if typeof(Translation) ~= "Vector3" then
-		error("Translation: Provided invalid data type (" .. typeof(Translation) .. "); please provide a Vector3 Value")
+	if typeof(translation) ~= "Vector3" then
+		error("Translation: Provided invalid data type (" .. typeof(translation) .. "); please provide a Vector3 Value")
 	end
-	local EasingStyle, EasingDirection = EasingStyle or "Sine", EasingDirection or "InOut"
-	local IsModel = Object:IsA("Model")
-	if IsModel then
-		if Object.PrimaryPart == nil then
-			local ModelDescendants = Object:GetDescendants()
-			for _, Descendant in next, ModelDescendants do
-				if Descendant:IsA("BasePart") then
-					Object.PrimaryPart = Descendant
+	easingStyle, easingDirection = easingStyle or "Sine", easingDirection or "InOut"
+
+	local isModel = obj:IsA("Model")
+	if isModel then
+		if not obj.PrimaryPart then
+			for _, descendant in next, obj:GetDescendants() do
+				if descendant:IsA("BasePart") then
+					obj.PrimaryPart = descendant
 					warn("PrimaryPart not present; function has automatically assigned a PrimaryPart")
 					break
 				end
 			end
 		end
 	end
-	local InternalCFrameValue = Instance.new("CFrameValue")
-	InternalTweenConfigs[Object] = InternalTweenConfigs[Object] or Instance.new("Configuration")
-	local AttConfig = InternalTweenConfigs[Object]
-	local TweenAttribute = (
-		"Tween_"
-		.. (IsLocalSpace and "Local" or "Global")
-		.. "_"
-		.. game:GetService("HttpService"):GenerateGUID(false):sub(1, 8)
-	)
-	AttConfig:SetAttribute(TweenAttribute, Vector3.new())
-	if AttConfig:GetAttribute("OriginalCFrame") == nil then
-		local refCFrame = IsModel and Object:GetPrimaryPartCFrame() or Object.CFrame
-		AttConfig:SetAttribute("OriginalCFrame", refCFrame)
-		AttConfig.AttributeChanged:Connect(function(ChangedAttribute)
-			local AppliedCFrame = AttConfig:GetAttribute("OriginalCFrame")
-			local Vectors = { ["Local"] = Vector3.new(), ["Global"] = Vector3.new() }
-			for AttributeName, AttributeValue in pairs(AttConfig:GetAttributes()) do
-				if AttributeName:find("Tween_") then
-					for VectorName, VectorValue in pairs(Vectors) do
-						if AttributeName:find(VectorName) then
-							Vectors[VectorName] = Vectors[VectorName] + AttributeValue
-						end
-					end
-				end
-			end
-			AppliedCFrame = AppliedCFrame * CFrame.new(Vectors.Local.X, Vectors.Local.Y, Vectors.Local.Z)
-			AppliedCFrame = AppliedCFrame + Vectors.Global
-			if IsModel then
-				Object:PivotTo(AppliedCFrame)
-			else
-				Object.CFrame = AppliedCFrame
-			end
-		end)
+
+	local internalCFrame = CFrame.new()
+
+	local info = internalTweenConfigs[obj]
+	if not info then
+		info = {}; internalTweenConfigs[obj] = info
 	end
-	InternalCFrameValue.Changed:Connect(function(NewCFrame)
-		AttConfig:SetAttribute(TweenAttribute, Vector3.new(NewCFrame.X, NewCFrame.Y, NewCFrame.Z))
-	end)
-	local TranslationTween = TweenService:Create(
-		InternalCFrameValue,
-		TweenInfo.new(Duration, Enum.EasingStyle[EasingStyle], Enum.EasingDirection[EasingDirection]),
-		{ Value = CFrame.new(Translation.X, Translation.Y, Translation.Z) }
-	)
-	TranslationTween.Completed:Connect(function()
-		InternalCFrameValue:Destroy()
-		AttConfig:SetAttribute(TweenAttribute, nil)
-		local CompleteCFrame = AttConfig:GetAttribute("OriginalCFrame")
-		if IsLocalSpace then
-			CompleteCFrame = CompleteCFrame * CFrame.new(Translation.X, Translation.Y, Translation.Z)
-		else
-			CompleteCFrame = CompleteCFrame + Translation
-		end
-		if IsModel then
-			Object:PivotTo(CompleteCFrame)
-		else
-			Object.CFrame = CompleteCFrame
-		end
-		AttConfig:SetAttribute("OriginalCFrame", CompleteCFrame)
-		local oldCFrame = IsModel and Object:GetPrimaryPartCFrame() or Object.CFrame
-	end)
-	TranslationTween:Play()
+	if info[1] and coroutine.status(info[1]) ~= "dead" then
+		task.cancel(info[1])
+	end
+	if not info[2] then
+		info[2] = isModel and obj:GetPrimaryPartCFrame() or obj.CFrame
+	end
+	info[1] = task.spawn(translatePart, tick(), obj, translation, duration, isLocalSpace, easingStyle, easingDirection, isModel)
 end
 
---Performs tweens on an objects properties and attributes
-function TimelinePlayer.Tween(Object, PropTable, AttributeInfo, TInfo, ApplyToDescendants, ApplyRelative)
-	local InternalValues =
-		{ ["CFrame"] = "CFrameValue", ["number"] = "NumberValue", ["Color3"] = "Color3Value", vector3 = "Vector3Value" }
-	for AttName, AttValue in next, AttributeInfo do
-		if not InternalValues[typeof(AttValue)] then
-			print(AttName, typeof(AttValue), "not a valid internal value type")
-		else
-			local NewInternalValue = Instance.new(InternalValues[typeof(AttValue)])
-			local AttributeTween = game:GetService("TweenService"):Create(NewInternalValue, TInfo, { Value = AttValue })
-			NewInternalValue.Value = Object:GetAttribute(AttName)
-			NewInternalValue:GetPropertyChangedSignal("Value"):Connect(function()
-				Object:SetAttribute(AttName, NewInternalValue.Value)
-			end)
-			AttributeTween.Completed:Connect(function()
-				NewInternalValue:Destroy()
-			end)
-			AttributeTween:Play()
-		end
-	end
-	local ObjectsToApplyTo = { Object }
-	if ApplyToDescendants == true then
-		for _, c in next, Object:GetDescendants() do
-			table.insert(ObjectsToApplyTo, c)
-		end
-	end
-	for _, Obj in next, ObjectsToApplyTo do
-		pcall(function()
-			local PropTween = game:GetService("TweenService"):Create(Obj, TInfo, PropTable)
-			PropTween:Play()
-		end)
-	end
-end
+local internalValues = {
+	CFrame = "CFrameValue",
+	number = "NumberValue",
+	Color3 = "Color3Value",
+	Vector3 = "Vector3Value"
+}
 
---Instantly sets the properties or attributes of an object
-function TimelinePlayer.SetProperties(Object, PropTable, AttributeTable, ApplyToDescendants, ApplyRelative)
-	if Object.Name == "Settings" or Object.Name == "Rescue" then
-		error(Object.Name .. " can not be accessed by SetProperties")
+function timelinePlayer.SetProperties(obj, properties, attributes, tInfo, applyToDescendants, relative)
+	local name = obj.Name
+	if name == "Settings" or name == "Rescue" then
+		error(name .. " can not be accessed by SetProperties")
 	end
-	if Object.Name ~= "Settings" and Object.Name ~= "Rescue" then
-		for AttName, AttValue in next, AttributeTable do
-			Object:SetAttribute(AttName, AttValue)
-		end
-	end
-	local ObjectsToApplyTo = { Object }
-	if ApplyToDescendants == true then
-		for _, c in next, Object:GetDescendants() do
-			table.insert(ObjectsToApplyTo, c)
-		end
-	end
-	for _, Obj in next, ObjectsToApplyTo do
-		for Name, Value in pairs(PropTable) do
+	for name, value in next, attributes do
+		if tInfo == 0 then
 			pcall(function()
-				Obj[Name] = Value
+				obj:SetAttribute(name, value)
 			end)
+			continue
 		end
+		local classMapping = internalValues[typeof(value)]
+		if not classMapping then
+			print(name, typeof(value), "not a valid internal value type")
+			continue
+		end
+		local internalValue = Instance.new(classMapping)
+		local tween = tweenService:Create(internalValue, tInfo, {
+			Value = classMapping == "CFrameValue" and obj:GetAttribute(name) * relative or value + relative})
+		internalValue.Value = obj:GetAttribute(name)
+		internalValue:GetPropertyChangedSignal("Value"):Connect(function()
+			obj:SetAttribute(name, internalValue.Value)
+		end)
+		tween.Completed:Connect(function()
+			internalValue:Destroy()
+		end)
+		tween:Play()
+	end
+	local objectsToApplyTo = applyToDescendants == true and {obj, unpack(obj:GetDescendants())} or {obj}
+	for i = 1, #objectsToApplyTo do
+		if tInfo == 0 then
+			for property, value in next, properties do
+				pcall(function()
+					local prop = objectsToApplyTo[property]
+					objectsToApplyTo[property] = typeof(prop) == "CFrame" and prop * value or prop + value
+				end)
+			end
+			continue
+		end
+		local properties = properties
+		if relative then
+			properties = table.clone(properties)
+			for property, value in next, properties do
+				pcall(function()
+					local prop = objectsToApplyTo[property]
+					properties[property] = typeof(prop) == "CFrame" and prop * value or prop + value
+				end)
+			end
+		end
+		pcall(function()
+			tweenService:Create(objectsToApplyTo[i], tInfo, properties):Play()
+		end)
 	end
 end
 
---Plays a sound in the map
-function TimelinePlayer.Sound(Object, ID, Volume, Pitch)
-	local NewSound = Instance.new("Sound")
-	NewSound.SoundId = "rbxassetid://" .. ID
-	NewSound.Volume = Volume
-	NewSound.Pitch = Pitch
-	NewSound.Parent = Object or script.Parent
-	NewSound:Play()
+function timelinePlayer.Sound(obj, id, volume, pitch)
+	local newSound = Instance.new("Sound")
+	newSound.SoundId = "rbxassetid://" .. id
+	newSound.Volume = 1
+	newSound.Pitch = pitch
+	newSound.Parent = obj or script.Parent
+	newSound:Play()
 end
 
-function TimelinePlayer.Alert(Message, Color, Duration)
+function timelinePlayer.Alert(msg, color, duration)
 	print("Alert function needs to be hooked up to the client!")
 end
 
-function TimelinePlayer.ShakeCamera(Intensity, Length)
+function timelinePlayer.ShakeCamera(intensity, length)
 	print("ShakeCamera function needs to be hooked up to the client!")
 end
 
---Teleports players
-function TimelinePlayer.Teleport(Destination, Player)
-	local PlayersToTele = Player and { Player } or {--[[Plug your own method for getting all ingame players here]]
-	}
-	for PlayerName, PlayerObject in pairs(PlayersToTele) do
-		if PlayerObject.Character and PlayerObject.Character:FindFirstChild("HumanoidRootPart") then
-			PlayerObject.Character.HumanoidRootPart.CFrame = Destination.CFrame
+local function teleportPlayer(destination, player)
+	local character = player.Character
+	if character then
+		local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+		if humanoidRootPart then
+			humanoidRootPart.CFrame = destination
 		end
 	end
 end
 
---Sets information for camera manipulation
-function TimelinePlayer.SetCamera(Subject, Enabled, CamInfo, RelativeToSubject)
+function timelinePlayer.Teleport(destination, player)
+	local destinationCFrame = destination.CFrame
+	if player then
+		teleportPlayer(destination, player)
+	else
+		for _, player in next, {--[[Plug your own method for getting all ingame players here]]} do
+			teleportPlayer(destination, player)
+		end
+	end
+end
+
+function timelinePlayer.SetCamera(subject, enabled, camInfo, relativeToSubject)
 	print("SetCamera needs to be hooked up to the client!")
 end
 
---Function Wrapper For Timeline Execution
-function TimelinePlayer.PerformXFrame(MapModel, XFrame, Player)
-	local Function, Position, Length =
-		XFrame:GetAttribute("XFrame_Function"),
-		XFrame:GetAttribute("XFrame_Timestamp"),
-		XFrame:GetAttribute("XFrame_Length")
-	if not Function or typeof(Function) ~= "string" then
-		error("XFrame " .. XFrame.Name .. " contains invalid function")
-	end
-	if not Position or typeof(Position) ~= "number" then
-		error("XFrame " .. XFrame.Name .. " contains invalid Timestamp")
-	end
-	if not Length or typeof(Length) ~= "number" then
-		Length = 0
-	end
-	if Function == "Tween" then
-		if XFrame.Value then
-			local AllAttributes = XFrame:GetAttributes()
-			local PropTable = {}
-			local AttributeTable = {}
-			for Name, Value in pairs(AllAttributes) do
-				if string.find(Name, "Property_") then
-					local PropertyName = string.sub(Name, 10)
-					PropTable[PropertyName] = Value
-				elseif string.find(Name, "Attribute_") then
-					AttributeTable[string.sub(Name, 11)] = Value
+local xFrameFunctions = {
+	SetProperties = function(map, xFrame, player, length, value, attributes_)
+		if value then
+			local properties, attributes = {}, {}
+			local isTween
+			
+			for name, value in next, attributes_ do
+				if string.sub(name, 1, 9) == "Property_" then
+					properties[string.sub(name, 10)] = value
+				elseif string.sub(name, 1, 10) == "Attribute_" then
+					attributes[string.sub(name, 11)] = value
+				elseif string.sub(name, 1, 6) == "Tween_" then
+					isTween = true
 				end
 			end
-			local TweenRepeat = typeof(XFrame:GetAttribute("Tween_RepeatCount")) == "number"
-					and XFrame:GetAttribute("Tween_RepeatCount")
-				or 0
-			local TInfo = TweenInfo.new(
-				Length,
-				Enum.EasingStyle[XFrame:GetAttribute("Tween_EasingStyle") or "Sine"],
-				Enum.EasingDirection[XFrame:GetAttribute("Tween_EasingDirection") or "InOut"],
-				TweenRepeat,
-				XFrame:GetAttribute("Tween_Reverses") or false,
-				XFrame:GetAttribute("Tween_DelayTime") or 0
-			)
-			TimelinePlayer.Tween(
-				XFrame.Value,
-				PropTable,
-				AttributeTable,
-				TInfo,
-				XFrame:GetAttribute("XFrame_ApplyToDescendants") or XFrame:GetAttribute("ApplyToDescendants"),
-				XFrame:GetAttribute("ApplyRelative")
+			
+			local arguments = {
+				value,
+				properties,
+				attributes,
+				0,
+				attributes_.XFrame_ApplyToDescendants or attributes_.ApplyToDescendants,
+				attributes.ApplyRelative
+			}
+			
+			if isTween then
+				arguments[4] = TweenInfo.new(
+					length,
+					Enum.EasingStyle[attributes_.Tween_EasingStyle or "Sine"],
+					Enum.EasingDirection[attributes_.Tween_EasingDirection or "InOut"],
+					attributes_.Tween_RepeatCount or 0,
+					attributes_.Tween_Reverses or false,
+					attributes_.Tween_DelayTime or 0
+				)
+			end
+			
+			timelinePlayer.SetProperties(unpack(arguments))
+		end
+	end,
+	SetWaterState = function(map, xFrame, player, length, value, attributes)
+		if value then
+			timelinePlayer.SetWaterState(
+				value,
+				attributes.State,
+				attributes.DontChangeColor,
+				attributes.SpecifiedColor
 			)
 		end
-		return
-	end
-	if Function == "SetProperties" then
-		if XFrame.Value then
-			local AllAttributes = XFrame:GetAttributes()
-			local PropTable = {}
-			local AttributeTable = {}
-			local IsTweenFunction = false
-			for Name, Value in pairs(AllAttributes) do
-				if string.find(Name, "Property_") then
-					PropTable[string.sub(Name, 10)] = Value
-				elseif string.find(Name, "Attribute_") then
-					AttributeTable[string.sub(Name, 11)] = Value
-				elseif string.find(Name, "Tween_") then
-					IsTweenFunction = true
-				end
-			end
+	end,
+	MovePart = function(map, xFrame, player, length, value, attributes)
+		if value then
+			timelinePlayer.MovePart(
+				value,
+				attributes.Translation,
+				length,
+				attributes.UseLocalSpace or false,
+				attributes.EasingStyle,
+				attributes.EasingDirection)
+		end
+	end,
+	Alert = function(map, xFrame, player, length, value, attributes)
+		timelinePlayer.Alert(attributes.Message, attributes.Color, length)
+	end,
+	Sound = function(map, xFrame, player, length, value, attributes)
+		timelinePlayer.Sound(value, attributes.SoundId, attributes.Volume or 1, attributes.Pitch or 1)
+	end,
+	ShakeCamera = function(map, xFrame, player, length, value, attributes)
+		timelinePlayer.ShakeCamera(attributes.Intensity, length)
+	end,
+	Teleport = function(map, xFrame, player, length, value, attributes)
+		timelinePlayer.Teleport(value, player)
+	end,
+	SetCamera = function(map, xFrame, player, length, value, attributes)
+		timelinePlayer.SetCamera(value, attributes.Enabled, attributes.CamInfo, attributes.RelativeToSubject)
+	end,
+	
+}
+xFrameFunctions.Tween = xFrameFunctions.SetProperties
 
-			if IsTweenFunction then
-				local TInfo = TweenInfo.new(
-					Length,
-					Enum.EasingStyle[XFrame:GetAttribute("Tween_EasingStyle") or "Sine"],
-					Enum.EasingDirection[XFrame:GetAttribute("Tween_EasingDirection") or "InOut"],
-					XFrame:GetAttribute("Tween_RepeatCount") or 0,
-					XFrame:GetAttribute("Tween_Reverses") or false,
-					XFrame:GetAttribute("Tween_DelayTime") or 0
-				)
-				TimelinePlayer.Tween(
-					XFrame.Value,
-					PropTable,
-					AttributeTable,
-					TInfo,
-					XFrame:GetAttribute("XFrame_ApplyToDescendants") or XFrame:GetAttribute("ApplyToDescendants"),
-					XFrame:GetAttribute("ApplyRelative")
-				)
-			else
-				TimelinePlayer.SetProperties(
-					XFrame.Value,
-					PropTable,
-					AttributeTable,
-					XFrame:GetAttribute("XFrame_ApplyToDescendants") or XFrame:GetAttribute("ApplyToDescendants"),
-					XFrame:GetAttribute("ApplyRelative")
-				)
-			end
-		end
-		return
+function timelinePlayer.PerformXFrame(map, xFrame, player)
+	local attributes = xFrame:GetAttributes()
+	local func, position, length = attributes.XFrame_Function, attributes.XFrame_Timestamp, attributes.XFrame_Length
+	
+	if type(func) ~= "string" then
+		error("XFrame " .. xFrame.Name .. " contains invalid function")
 	end
-	if Function == "SetWaterState" then
-		if XFrame.Value then
-			TimelinePlayer.SetWaterState(
-				XFrame.Value,
-				XFrame:GetAttribute("State"),
-				XFrame:GetAttribute("DontChangeColor"),
-				XFrame:GetAttribute("SpecifiedColor")
-			)
-		end
-		return
+	
+	if type(position) ~= "number" then
+		error("XFrame " .. xFrame.Name .. " contains invalid Timestamp")
 	end
-	if Function == "MovePart" then
-		if XFrame.Value then
-			TimelinePlayer.MovePart(
-				XFrame.Value,
-				XFrame:GetAttribute("Translation"),
-				Length,
-				XFrame:GetAttribute("UseLocalSpace") or false,
-				XFrame:GetAttribute("EasingStyle"),
-				XFrame:GetAttribute("EasingDirection")
-			)
-		end
-		return
+	
+	if type(length) ~= "number" then
+		length = 0
 	end
-	if Function == "Alert" then
-		TimelinePlayer.Alert(XFrame:GetAttribute("Message"), XFrame:GetAttribute("Color"), Length)
-		return
-	end
-	if Function == "Sound" then
-		TimelinePlayer.Sound(
-			XFrame.Value,
-			XFrame:GetAttribute("SoundId"),
-			XFrame:GetAttribute("Volume") or 1,
-			XFrame:GetAttribute("Pitch") or 1
-		)
-		return
-	end
-	if Function == "ShakeCamera" then
-		TimelinePlayer.ShakeCamera(XFrame:GetAttribute("Intensity"), Length)
-		return
-	end
-	if Function == "Teleport" then
-		TimelinePlayer.Teleport(XFrame.Value, Player)
-		return
-	end
-	if Function == "SetCamera" then
-		TimelinePlayer.SetCamera(
-			XFrame.Value,
-			XFrame:GetAttribute("Enabled"),
-			XFrame:GetAttribute("CamInfo"),
-			XFrame:GetAttribute("RelativeToSubject")
-		)
-		return
+	
+	if xFrameFunctions[func] then
+		xFrameFunctions[func](map, xFrame, player, length, xFrame.Value, attributes)
 	end
 end
 
-------------TIMELINE WRAPPER
---Validates a Timeline
-local function ValidateIsTimeline(Timeline)
-	if Timeline:IsA("Configuration") then
-		if
-			Timeline:GetAttribute("Trigger_Delay")
+-- Validates a timeline
+local function validateIsTimeline(Timeline)
+	return Timeline.ClassName == "Configuration" and (
+		Timeline:GetAttribute("Trigger_Delay")
 			or Timeline:GetAttribute("Trigger_Button")
 			or Timeline:GetAttribute("Trigger_Timeline")
 			or Timeline:GetAttribute("Trigger_Touch")
-		then
-			return true
-		end
-	end
+	)
 end
 
---Validates an XFrame
-local function ValidateIsXFrame(XFrame)
-	if XFrame:IsA("ObjectValue") then
-		if
-			typeof(XFrame:GetAttribute("XFrame_Function")) == "string"
-			and typeof(XFrame:GetAttribute("XFrame_Timestamp")) == "number"
-		then
-			return true
-		end
-	end
+-- Validates an XFrame
+local function validateIsXFrame(XFrame)
+	return XFrame.ClassName == "ObjectValue" and (
+		type(XFrame:GetAttribute("XFrame_Function")) == "string"
+			and type(XFrame:GetAttribute("XFrame_Timestamp")) == "number"
+	)
 end
 
---Gets duration of Timeline
-local function GetTimelineDuration(Timeline)
-	local FurthestPointInTime = 0
-	for _, Keyframe in pairs(Timeline:GetChildren()) do
-		local KeyframeEndPoint = 0
-		local Time_Position, Time_Duration =
-			Keyframe:GetAttribute("XFrame_Timestamp"), Keyframe:GetAttribute("XFrame_Length") or 0
-		if typeof(Time_Position) == "number" then
-			if typeof(Time_Duration) == "number" then
-				local TweenRepeatCount = Keyframe:GetAttribute("Tween_RepeatCount") or 0
-				if TweenRepeatCount == -1 then
-					TweenRepeatCount = math.huge
+-- Retrieves a timeline's duration
+local function getTimelineDuration(timeline)
+	local maxTime = 0
+	local children = timeline:GetChildren()
+	for i = 1, #children do
+		local keyframe = children[i]
+		local attributes = keyframe:GetAttributes()
+		local position = attributes.XFrame_Timestamp
+		if type(position) == "number" then
+			local duration = attributes.XFrame_Length
+			if type(duration) == "number" then
+				local repeatCount = attributes.Tween_RepeatCount
+				if repeatCount == -1 then
+					return math.huge
 				end
-				local TweenRepeatMultiplier = 1 + TweenRepeatCount
-				KeyframeEndPoint = Time_Position
-					+ ((Time_Duration * TweenRepeatMultiplier) * (Keyframe:GetAttribute("Tween_Reverses") and 2 or 1))
-			else
-				KeyframeEndPoint = Time_Position
+				position += ((duration * repeatCount) * (attributes.Tween_Reverses and 2 or 1))
+			end
+			if position > maxTime then
+				maxTime = position
 			end
 		end
-		if KeyframeEndPoint > FurthestPointInTime then
-			FurthestPointInTime = KeyframeEndPoint
-		end
 	end
-	return FurthestPointInTime
+	return maxTime
 end
 
---Executes all XFrames within Timeline
-local function PlayTimeline(Timeline, Player)
-	local Loop = Timeline:GetAttribute("RepeatOnCompletion")
-	local MultipleTouches = Timeline:GetAttribute("Touch_AllowMultiple")
-	local TimelineDuration = GetTimelineDuration(Timeline)
-	local TimelineDelay = Timeline:GetAttribute("Trigger_Delay")
-	if typeof(TimelineDelay) == "number" and TimelineDelay > 0 then
-		task.wait(TimelineDelay)
+-- Executes all XFrames within a Timeline
+local function playTimeline(timeline, player)
+	local attributes = timeline:GetAttributes()
+	local delay = attributes.Trigger_Delay
+	if type(delay) == "number" and delay > 0 then
+		task.wait(delay)
 	end
-	repeat
-		for _, Keyframe in pairs(Timeline:GetDescendants()) do
-			if ValidateIsXFrame(Keyframe) then
-				local Time_Position = Keyframe:GetAttribute("XFrame_Timestamp")
-				local Time_Duration = Keyframe:GetAttribute("XFrame_Length") or 0
+	local canLoop, allowMultipleTouches, duration =
+		attributes.RepeatOnCompletion,
+		attributes.Touch_AllowMultiple,
+		getTimelineDuration(timeline)
+	while canLoop or not allowMultipleTouches do
+		for _, keyframe in next, timeline:GetDescendants() do
+			if validateIsXFrame(keyframe) then
+				local position = keyframe:GetAttribute("XFrame_Timestamp")
 				if
-					typeof(Time_Position) == "number"
-					and typeof(Keyframe:GetAttribute("XFrame_Function")) == "string"
+					type(position) == "number"
+					and type(keyframe:GetAttribute("XFrame_Function")) == "string"
 				then
-					task.delay(Time_Position, function()
-						TimelinePlayer.PerformXFrame(script.Parent, Keyframe, Player)
-					end)
+					task.delay(position, timelinePlayer.PerformXFrame, script.Parent, keyframe, player)
 				end
 			end
 		end
-		task.wait(TimelineDuration)
-	until Loop ~= true or MultipleTouches == true
-	for _, c in pairs(Timelines:GetDescendants()) do
-		if ValidateIsTimeline(c) then
-			if c:GetAttribute("Trigger_Timeline") == Timeline.Name then
-				task.spawn(PlayTimeline, c)
-			end
+		if duration == math.huge then
+			return
+		end
+		task.wait(duration)
+	end
+	for _, timeline in timelines:GetDescendants() do
+		if validateIsTimeline(timeline) and timeline.Name == attributes.Trigger_Timeline then
+			coroutine.resume(coroutine.create(playTimeline), timeline)
 		end
 	end
 end
 
---Timeline Listeners
---Button Listener
-Lib.Button:connect(function(p, bNo)
-	for _, Timeline in pairs(Timelines:GetDescendants()) do
-		if ValidateIsTimeline(Timeline) then
-			local TimelineTrigger, ButtonTrigger =
-				Timeline:GetAttribute("Trigger_Timeline"), Timeline:GetAttribute("Trigger_Button")
-			if not (typeof(TimelineTrigger) == "string" and TimelineTrigger ~= "") then
-				if ButtonTrigger == bNo then
-					task.spawn(PlayTimeline, Timeline)
-				end
+-- Connects Lib.Button to LibMap-based games
+Lib.Button:connect(function(player, buttonNumber)
+	for _, timeline in timelines:GetDescendants() do
+		if validateIsTimeline(timeline) then
+			local timelineTrigger, buttonTrigger = timeline:GetAttribute("Trigger_Timeline"), timeline:GetAttribute("Trigger_Button")
+			if (type(timelineTrigger) ~= "string" or timelineTrigger ~= "") and buttonTrigger == buttonNumber then
+				coroutine.resume(coroutine.create(playTimeline), timeline)
 			end
 		end
 	end
 end)
 
---Extra Timeline Listeners
-local AllObjects = script.Parent:GetDescendants()
-for _, Timeline in pairs(Timelines:GetDescendants()) do
-	if ValidateIsTimeline(Timeline) then
-		local TimelineTrigger, ButtonTrigger, TouchTrigger, DelayTrigger =
-			Timeline:GetAttribute("Trigger_Timeline"),
-			Timeline:GetAttribute("Trigger_Button"),
-			Timeline:GetAttribute("Trigger_Touch"),
-			Timeline:GetAttribute("Trigger_Delay")
-		if typeof(TouchTrigger) == "string" and TouchTrigger ~= "" then
-			local AllowedToRun = true
-			if typeof(TimelineTrigger) == "string" and TimelineTrigger ~= "" then
-				AllowedToRun = false
-			end
-			if typeof(ButtonTrigger) == "number" and ButtonTrigger > 0 then
-				AllowedToRun = false
-			end
-			if AllowedToRun == true then
-				local TouchListenerCount = 0
-				local MaxTouchListeners = 10
-				local PlayerDebounce = {}
-				local TouchedOnce = false
-				local TouchAllowMultiple = Timeline:GetAttribute("Touch_AllowMultiple")
-				for _, Object in pairs(AllObjects) do
-					if Object:IsA("BasePart") and Object.Name == TouchTrigger then
-						if TouchListenerCount < MaxTouchListeners then
-							TouchListenerCount += 1
-							Object.Touched:Connect(function(hit)
-								if not (TouchedOnce == true and TouchAllowMultiple ~= true) then
-									local Player = game.Players:GetPlayerFromCharacter(hit.Parent)
-									if Player and not PlayerDebounce[tostring(Player.UserId)] then
-										PlayerDebounce[tostring(Player.UserId)] = true
-										TouchedOnce = true
-										task.spawn(PlayTimeline, Timeline, TouchAllowMultiple and Player)
-										if TouchAllowMultiple then
-											task.wait(1)
-											PlayerDebounce[tostring(Player.UserId)] = false
-										end
+-- Generic start function
+local mapObjs = script.Parent:GetDescendants()
+local timelineDescendants = timelines:GetDescendants()
+for i = 1, #timelineDescendants do
+	local timeline = timelineDescendants[i]
+	if validateIsTimeline(timeline) then
+		local attributes = timeline:GetAttributes()
+		local timelineTrigger, buttonTrigger, touchTrigger, delayTrigger =
+			attributes.Trigger_Timeline,
+			attributes.Trigger_Button,
+			attributes.Trigger_Touch,
+			attributes.Trigger_Delay
+		if type(touchTrigger) == "string" and touchTrigger ~= "" then
+			if (type(touchTrigger) ~= "string" or touchTrigger == "")
+				or (type(buttonTrigger) ~= "number" or buttonTrigger <= 0) then
+				local listeners, maxListeners = {}, 10
+				local debounces = {}
+				local allowMultiple = timeline:GetAttribute("Touch_AllowMultiple")
+				for i = 1, #mapObjs do
+					local obj = mapObjs[i]
+					if obj.Name == touchTrigger and obj:IsA("BasePart") and #listeners < maxListeners then
+						local connection
+						connection = obj.Touched:Connect(function(hit)
+							local player = players:GetPlayerFromCharacter(hit.Parent)
+							if player then
+								local uid = player.UserId
+								if not table.find(debounces, uid) then
+									table.insert(debounces, uid)
+									task.spawn(playTimeline, timeline, allowMultiple and player)
+									if allowMultiple then
+										task.wait(1)
+										table.remove(debounces, table.find(debounces, uid) or 0)
+										return
+									end
+									debounces = nil
+									local find = table.find(listeners, connection)
+									if find then
+										connection:Disconnect()
+										table.remove(listeners, find)
 									end
 								end
-							end)
-						end
+							end
+						end)
+						table.insert(listeners, connection)
 					end
 				end
 			end
-		else
-			if typeof(DelayTrigger) == "number" then
-				local AllowedToRun = true
-				if typeof(TimelineTrigger) == "string" and TimelineTrigger ~= "" then
-					AllowedToRun = false
-				end
-				if typeof(ButtonTrigger) == "number" and ButtonTrigger > 0 then
-					AllowedToRun = false
-				end
-				if typeof(TouchTrigger) == "string" and TouchTrigger ~= "" then
-					AllowedToRun = false
-				end
-				if AllowedToRun == true then
-					task.spawn(PlayTimeline, Timeline)
-				end
+			continue
+		end
+		if type(delayTrigger) == "number" then
+			if (type(timelineTrigger) ~= "string" or timelineTrigger == "")
+				or (type(buttonTrigger) ~= "number" or buttonTrigger <= 0)
+				or (type(touchTrigger) ~= "string" or touchTrigger == "") then
+				task.spawn(playTimeline, timeline)
 			end
 		end
 	end
 end
+
+return timelinePlayer
