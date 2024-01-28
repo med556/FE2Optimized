@@ -35,24 +35,33 @@ local function translatePart(startTime, obj, translation, duration, isLocalSpace
 	easingStyle, easingDirection = Enum.EasingStyle[easingStyle], Enum.EasingDirection[easingDirection]
 
 	local translateCheckpoint = Vector3.zero
-	
+
 	while true do
 		local time = math.min(duration, tick() - startTime)
-		
+
 		local translate = translation * tweenService:GetValue(time / duration, easingStyle, easingDirection)
 		local interpolation = translate - translateCheckpoint
 		translateCheckpoint = translate
-		
+
 		if isModel then
 			heartbeat:Wait()
 			local pivot = obj:GetPivot()
 			obj:PivotTo(isLocalSpace and pivot * CFrame.new(interpolation) or pivot + interpolation)
+			
+			if time >= duration then
+				break
+			end
+			
 			continue
 		end
-		
+
 		local objCFrame = obj.CFrame
 		obj.CFrame = isLocalSpace and objCFrame * CFrame.new(interpolation) or objCFrame + interpolation
 		
+		if time >= duration then
+			break
+		end
+
 		heartbeat:Wait()
 	end
 end
@@ -111,13 +120,7 @@ function timelinePlayer.MovePart(obj, translation, duration, isLocalSpace, easin
 	if not info then
 		info = {}; internalTweenConfigs[obj] = info
 	end
-	if info[1] and coroutine.status(info[1]) ~= "dead" then
-		task.cancel(info[1])
-	end
-	if not info[2] then
-		info[2] = isModel and obj:GetPrimaryPartCFrame() or obj.CFrame
-	end
-	info[1] = task.spawn(translatePart, tick(), obj, translation, duration, isLocalSpace, easingStyle, easingDirection, isModel)
+	table.insert(internalTweenConfigs, task.spawn(translatePart, tick(), obj, translation, duration, isLocalSpace, easingStyle, easingDirection, isModel))
 end
 
 local internalValues = {
@@ -230,7 +233,7 @@ local xFrameFunctions = {
 		if value then
 			local properties, attributes = {}, {}
 			local isTween
-			
+
 			for name, value in next, attributes_ do
 				if string.sub(name, 1, 9) == "Property_" then
 					properties[string.sub(name, 10)] = value
@@ -307,19 +310,19 @@ xFrameFunctions.Tween = xFrameFunctions.SetProperties
 function timelinePlayer.PerformXFrame(map, xFrame, player)
 	local attributes = xFrame:GetAttributes()
 	local func, position, length = attributes.XFrame_Function, attributes.XFrame_Timestamp, attributes.XFrame_Length
-	
+
 	if type(func) ~= "string" then
 		error("XFrame " .. xFrame.Name .. " contains invalid function")
 	end
-	
+
 	if type(position) ~= "number" then
 		error("XFrame " .. xFrame.Name .. " contains invalid Timestamp")
 	end
-	
+
 	if type(length) ~= "number" then
 		length = 0
 	end
-	
+
 	if xFrameFunctions[func] then
 		xFrameFunctions[func](map, xFrame, player, length, xFrame.Value, attributes)
 	end
@@ -354,11 +357,11 @@ local function getTimelineDuration(timeline)
 		if type(position) == "number" then
 			local duration = attributes.XFrame_Length
 			if type(duration) == "number" then
-				local repeatCount = attributes.Tween_RepeatCount
+				local repeatCount = attributes.Tween_RepeatCount or 0
 				if repeatCount == -1 then
 					return math.huge
 				end
-				position += ((duration * repeatCount) * (attributes.Tween_Reverses and 2 or 1))
+				position += ((duration * (repeatCount + 1)) * (attributes.Tween_Reverses and 2 or 1))
 			end
 			if position > maxTime then
 				maxTime = position
@@ -379,7 +382,7 @@ local function playTimeline(timeline, player)
 		attributes.RepeatOnCompletion,
 		attributes.Touch_AllowMultiple,
 		getTimelineDuration(timeline)
-	while canLoop or not allowMultipleTouches do
+	repeat
 		for _, keyframe in next, timeline:GetDescendants() do
 			if validateIsXFrame(keyframe) then
 				local position = keyframe:GetAttribute("XFrame_Timestamp")
@@ -395,7 +398,7 @@ local function playTimeline(timeline, player)
 			return
 		end
 		task.wait(duration)
-	end
+	until not canLoop or allowMultipleTouches
 	for _, timeline in timelines:GetDescendants() do
 		if validateIsTimeline(timeline) and timeline.Name == attributes.Trigger_Timeline then
 			coroutine.resume(coroutine.create(playTimeline), timeline)
